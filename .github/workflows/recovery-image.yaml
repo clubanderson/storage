@@ -1,0 +1,158 @@
+name: Reviewed v0.0.247 recovery image
+
+on:
+  push:
+    branches: [fix-v0247-pool-cancellation-20261102]
+    paths: [.github/workflows/recovery-image.yaml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: storage-v0247-reviewed-recovery
+  cancel-in-progress: false
+
+env:
+  SOURCE_SHA: 0ee672f15d610dc565adcc79ca4a0ec7b55d6073
+  VERSION: v0.0.247-recovery-0ee672f15d610dc565adcc79ca4a0ec7b55d6073
+  IMAGE: ghcr.io/clubanderson/storage-recovery:v0.0.247-recovery-0ee672f15d610dc565adcc79ca4a0ec7b55d6073
+
+jobs:
+  linux-tests:
+    if: github.repository == 'clubanderson/storage' && github.ref == 'refs/heads/fix-v0247-pool-cancellation-20261102'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GOCACHE: ${{ github.workspace }}/.recovery-ci/cache
+      GOMODCACHE: ${{ github.workspace }}/.recovery-ci/modules
+      GOPATH: ${{ github.workspace }}/.recovery-ci/gopath
+      TMPDIR: ${{ github.workspace }}/.recovery-ci/work
+      GOTMPDIR: ${{ github.workspace }}/.recovery-ci/work
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: 0ee672f15d610dc565adcc79ca4a0ec7b55d6073
+          path: source
+          persist-credentials: false
+      - run: mkdir -p .recovery-ci/{cache,modules,gopath,work,results}
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: source/go.mod
+          cache: false
+      - name: Verify source and execute actual SQLite suites, vet and full server build
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          printf '%s  build/Dockerfile\n' 694660f70b28b1c1de1d32fca2ae549ad62801d76190db40b669babb0097f8ba | sha256sum --check
+          go version | tee ../.recovery-ci/results/toolchain.txt
+          # This exact baseline race is reproduced independently; no other tests are excluded.
+          go test -race ./pkg/registry/file ./pkg/utils -skip '^TestFileSystemStorageWatchReturnsDistinctWatchers$' -count=3 -timeout=5m -json | tee ../.recovery-ci/results/sqlite-tests.jsonl
+          go vet ./pkg/registry/file ./pkg/utils
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ../.recovery-ci/results/storage .
+          file ../.recovery-ci/results/storage | tee ../.recovery-ci/results/server-format.txt
+          sha256sum go.mod go.sum build/Dockerfile ../.recovery-ci/results/storage > ../.recovery-ci/results/source-build-hashes.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: recovery-linux-tests
+          path: .recovery-ci/results
+          if-no-files-found: error
+
+  publish:
+    needs: linux-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: 0ee672f15d610dc565adcc79ca4a0ec7b55d6073
+          path: source
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f03ac48505955848960e80bbb68046aa35c7b9e7 # v2
+      - name: Authenticate only to owner-controlled GHCR
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .recovery-ci/results
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u clubanderson --password-stdin
+      - name: Build unchanged release Dockerfile and validate container before publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
+          printf '%s  source/build/Dockerfile\n' 694660f70b28b1c1de1d32fca2ae549ad62801d76190db40b669babb0097f8ba | sha256sum --check
+          docker buildx build --platform linux/amd64 --load --provenance=false \
+            --file source/build/Dockerfile --tag "$IMAGE" --build-arg image_version="$VERSION" \
+            --label org.opencontainers.image.revision="$SOURCE_SHA" \
+            --label org.opencontainers.image.source=https://github.com/clubanderson/storage \
+            --label org.opencontainers.image.version="$VERSION" source
+          docker image inspect "$IMAGE" > .recovery-ci/results/image-config.json
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          image = json.loads(Path('.recovery-ci/results/image-config.json').read_text())[0]
+          assert (image['Os'], image['Architecture']) == ('linux', 'amd64')
+          config = image['Config']
+          assert config['User'] in ('65532', '65532:65532', 'nonroot')
+          assert config['Entrypoint'] == ['storage']
+          assert 'RELEASE=' + os.environ['VERSION'] in config['Env']
+          labels = config['Labels']
+          assert labels['org.opencontainers.image.revision'] == os.environ['SOURCE_SHA']
+          assert labels['org.opencontainers.image.source'] == 'https://github.com/clubanderson/storage'
+          assert labels['org.opencontainers.image.version'] == os.environ['VERSION']
+          PY
+      - name: Verify run-scoped candidate before promoting its exact digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidate="${IMAGE%:*}:candidate-${SOURCE_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker buildx build --platform linux/amd64 --push --provenance=mode=max \
+            --metadata-file .recovery-ci/results/build-metadata.json \
+            --file source/build/Dockerfile --tag "$candidate" --build-arg image_version="$VERSION" \
+            --label org.opencontainers.image.revision="$SOURCE_SHA" \
+            --label org.opencontainers.image.source=https://github.com/clubanderson/storage \
+            --label org.opencontainers.image.version="$VERSION" source
+          digest=$(jq -r '."containerimage.digest"' .recovery-ci/results/build-metadata.json)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker buildx imagetools inspect "${IMAGE%:*}@$digest" --raw > .recovery-ci/results/candidate-manifest.json
+          docker pull --platform linux/amd64 "${IMAGE%:*}@$digest"
+          docker image inspect "${IMAGE%:*}@$digest" > .recovery-ci/results/candidate-config.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          manifest = json.loads(Path('.recovery-ci/results/candidate-manifest.json').read_text())
+          assert manifest['mediaType'] == 'application/vnd.oci.image.index.v1+json'
+          before = json.loads(Path('.recovery-ci/results/image-config.json').read_text())[0]
+          after = json.loads(Path('.recovery-ci/results/candidate-config.json').read_text())[0]
+          for field in ('Os', 'Architecture', 'Config', 'RootFS'):
+              assert before[field] == after[field], 'Candidate differs: ' + field
+          PY
+          # A single index source is copied, not rebuilt; this is not registry compare-and-swap.
+          if docker manifest inspect "$IMAGE" > .recovery-ci/results/prepromotion-manifest.json 2> .recovery-ci/results/prepromotion.stderr; then
+            echo 'Recovery tag appeared; refusing to replace it.' >&2
+            exit 1
+          fi
+          if grep -Eiq 'unauthorized|denied|forbidden|401|403' .recovery-ci/results/prepromotion.stderr; then
+            cat .recovery-ci/results/prepromotion.stderr >&2
+            exit 1
+          fi
+          grep -Eq 'manifest unknown|no such manifest' .recovery-ci/results/prepromotion.stderr
+          docker buildx imagetools create --tag "$IMAGE" "${IMAGE%:*}@$digest"
+          docker buildx imagetools inspect "$IMAGE" --raw > .recovery-ci/results/published-manifest.json
+          cmp .recovery-ci/results/candidate-manifest.json .recovery-ci/results/published-manifest.json
+          actual=$(docker buildx imagetools inspect "$IMAGE" --format '{{.Manifest.Digest}}')
+          test "$actual" = "$digest"
+          printf 'source=%s\nworkflow=%s\nrun=%s\nimage=%s@%s\n' "$SOURCE_SHA" "$GITHUB_SHA" "$GITHUB_RUN_ID" "${IMAGE%:*}" "$digest" | tee .recovery-ci/results/publication.txt >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: recovery-image-receipt
+          path: .recovery-ci/results
+          if-no-files-found: error
