@@ -230,39 +230,54 @@ func (a *ContainerProfileProcessor) cleanup() error {
 // Expired time series are always marked as Completed/Partial unless they were already Completed/Full,
 // ensuring incomplete profiles don't remain in a Learning state indefinitely.
 func (a *ContainerProfileProcessor) ConsolidateTimeSeries(ctx context.Context) error {
-	ctx, cleanup, err := a.ContainerProfileStorage.WithConnection(ctx)
+	listCtx, cleanup, err := a.ContainerProfileStorage.WithConnection(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer cleanup()
-
 	// Phase 1: Process expired time series
 	// These are marked as Completed/Partial (unless already Completed/Full)
-	expired, err := a.ContainerProfileStorage.ListTimeSeriesExpired(ctx, a.DeleteThreshold)
+	expired, err := a.ContainerProfileStorage.ListTimeSeriesExpired(listCtx, a.DeleteThreshold)
+	cleanup()
 	if err != nil {
 		return fmt.Errorf("failed to list time: %w", err)
 	}
 
 	for _, key := range expired {
-		if err := a.consolidateKeyTimeSeries(ctx, key, true); err != nil {
+		if err := a.consolidateKeyWithConnection(ctx, key, true); err != nil {
 			return err
 		}
 	}
 
 	// Phase 2: Process active time series with data
 	// These follow normal completion flow based on their status
-	withData, err := a.ContainerProfileStorage.ListTimeSeriesWithData(ctx)
+	listCtx, cleanup, err = a.ContainerProfileStorage.WithConnection(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to acquire listing connection: %w", err)
+	}
+	withData, err := a.ContainerProfileStorage.ListTimeSeriesWithData(listCtx)
+	cleanup()
 	if err != nil {
 		return fmt.Errorf("failed to list time: %w", err)
 	}
 
 	for _, key := range withData {
-		if err := a.consolidateKeyTimeSeries(ctx, key, false); err != nil {
+		if err := a.consolidateKeyWithConnection(ctx, key, false); err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+// Return each key's connection before proceeding to the next key. Keep the
+// existing serial ordering and per-key transaction ownership.
+func (a *ContainerProfileProcessor) consolidateKeyWithConnection(ctx context.Context, key string, expired bool) error {
+	keyCtx, cleanup, err := a.ContainerProfileStorage.WithConnection(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to acquire consolidation connection: %w", err)
+	}
+	defer cleanup()
+	return a.consolidateKeyTimeSeries(keyCtx, key, expired)
 }
 
 // consolidateKeyTimeSeries consolidates time series data for a single key.

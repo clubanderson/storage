@@ -86,6 +86,43 @@ of rows returned. On subsequent calls, the client provides the last ROWID to get
 
 Note that `GetList()` returns the list of objects with a `nil` Spec for performance reasons, as the CRDs are quite big.
 
+### Legacy request and commit lifetimes
+
+Metadata LIST acquisition and key-lock waits follow the requesting context's
+cancellation and deadline. Single-key REST operations obtain the key before a
+connection, but release the key if the pool is exhausted so an existing connection
+owner can finish. These REST entry points never reserve a connection while waiting
+for its key; caller-owned `WithConn` operations retain their ownership contract.
+Consolidation retains its serial expired/active ordering and owns one connection
+per key rather than retaining a connection across the whole pass.
+
+Legacy Gob payloads are staged and closed in the same directory before metadata
+is changed. A per-object SQLite savepoint protects publication failures; an open
+previous payload permits restoration if the savepoint fails after publication.
+Already-begun REST commits retain the legacy non-cancellable SQL lifetime.
+Cancellation before a commit begins and failed reads/writes return errors instead of
+success-shaped incomplete results. Caller-owned background transactions still own
+their final commit.
+
+This does not change the database schema, Gob format, API versions, dependency
+versions, worker concurrency, or WatchList feature gates. LIST resourceVersion
+follows upstream [#429](https://github.com/kubescape/storage/pull/429): the maximum
+numeric item version, or `1` for an empty collection. It is not a new global MVCC
+revision or a WatchList snapshot guarantee.
+
+Staging requires temporary free space for the new payload beside the old one.
+SQLite and the filesystem are still separate durable stores: this is not a
+general crash-recovery journal or a guarantee against a second I/O failure while
+restoring a payload.
+
+Targeted regressions and the related package suites:
+
+```sh
+go test ./pkg/registry/file -run '^TestReleaseBackport' -count=1
+go test ./pkg/registry/file ./pkg/utils
+go test -race ./pkg/registry/file ./pkg/utils -count=3
+```
+
 ### Filesystem layout
 
 The filesystem contains both the metadata database and the payload files.
