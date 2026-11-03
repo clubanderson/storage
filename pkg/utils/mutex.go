@@ -46,19 +46,21 @@ func (m *MapMutex[T]) Lock(ctx context.Context, key T) error {
 	lock := m.ensureLock(key)
 	ticker := backoff.NewTicker(backoff.NewExponentialBackOff())
 	defer ticker.Stop()
-	for range ticker.C {
+	for {
 		select {
 		case <-done:
 			// context has expired
 			return ctx.Err()
-		default:
+		case _, open := <-ticker.C:
+			if !open {
+				return TimeOutError
+			}
 		}
 		if lock.TryLock() {
 			// lock acquired
 			return nil
 		}
 	}
-	return TimeOutError
 }
 
 func (m *MapMutex[T]) RLock(ctx context.Context, key T) error {
@@ -69,19 +71,21 @@ func (m *MapMutex[T]) RLock(ctx context.Context, key T) error {
 	lock := m.ensureLock(key)
 	ticker := backoff.NewTicker(backoff.NewExponentialBackOff())
 	defer ticker.Stop()
-	for range ticker.C {
+	for {
 		select {
 		case <-done:
 			// context has expired
 			return ctx.Err()
-		default:
+		case _, open := <-ticker.C:
+			if !open {
+				return TimeOutError
+			}
 		}
 		if lock.TryRLock() {
 			// lock acquired
 			return nil
 		}
 	}
-	return TimeOutError
 }
 
 func (m *MapMutex[T]) RUnlock(key T) {
